@@ -90,3 +90,50 @@
 
 (define-private (uint-to-int (n uint))
   n)
+
+
+
+(define-map revoked-certificates uint bool)
+
+(define-public (revoke-certificate (token-id uint))
+  (let ((cert-data (unwrap! (map-get? certificate-data token-id) err-invalid-cert)))
+    (asserts! (is-authorized-issuer tx-sender) err-not-authorized)
+    (asserts! (is-eq (get issuer cert-data) tx-sender) err-not-authorized)
+    (map-set revoked-certificates token-id true)
+    (ok true)))
+
+(define-read-only (is-certificate-revoked (token-id uint))
+  (default-to false (map-get? revoked-certificates token-id)))
+
+
+
+(define-map certificate-metadata
+  uint 
+  {
+    course-duration: uint,
+    certification-level: (string-ascii 20),
+    expiration-date: uint,
+    additional-notes: (string-ascii 100)
+  })
+
+(define-public (set-certificate-metadata 
+    (token-id uint)
+    (course-duration uint)
+    (certification-level (string-ascii 20))
+    (expiration-date uint)
+    (additional-notes (string-ascii 100)))
+  (let ((cert-data (unwrap! (map-get? certificate-data token-id) err-invalid-cert)))
+    (asserts! (is-authorized-issuer tx-sender) err-not-authorized)
+    (asserts! (is-eq (get issuer cert-data) tx-sender) err-not-authorized)
+    (ok (map-set certificate-metadata token-id
+      {
+        course-duration: course-duration,
+        certification-level: certification-level,
+        expiration-date: expiration-date,
+        additional-notes: additional-notes
+      }))))
+
+(define-read-only (get-certificate-metadata (token-id uint))
+  (ok (map-get? certificate-metadata token-id)))
+
+
