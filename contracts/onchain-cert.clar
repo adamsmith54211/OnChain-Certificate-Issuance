@@ -137,3 +137,133 @@
   (ok (map-get? certificate-metadata token-id)))
 
 
+(define-constant err-invalid-token (err u200))
+(define-constant err-verification-failed (err u201))
+
+(define-map verification-logs
+  uint
+  {
+    verifier: principal,
+    verification-date: uint,
+    verification-count: uint
+  })
+
+(define-data-var total-verifications uint u0)
+
+(define-public (verify-certificate (token-id uint))
+  (let (
+    (cert-data (map-get? certificate-data token-id))
+    (cert-metadata (map-get? certificate-metadata token-id))
+    (is-revoked (default-to false (map-get? revoked-certificates token-id)))
+    (current-height stacks-block-height)
+  )
+  (match cert-data
+    data (let (
+      (issuer (get issuer data))
+      (is-issuer-authorized (default-to false (map-get? authorized-issuers issuer)))
+      (is-expired (match cert-metadata
+        metadata (> current-height (get expiration-date metadata))
+        false))
+      (owner (nft-get-owner? certificate token-id))
+    )
+    (begin
+      (update-verification-log token-id)
+      (ok {
+        token-id: token-id,
+        is-valid: (and is-issuer-authorized (not is-revoked) (not is-expired) (is-some owner)),
+        is-revoked: is-revoked,
+        is-expired: is-expired,
+        issuer-authorized: is-issuer-authorized,
+        owner: owner,
+        issuer: issuer,
+        recipient: (get recipient data),
+        course: (get course data),
+        grade: (get grade data),
+        institution: (get institution data),
+        issue-date: (get date data),
+        verification-date: current-height
+      })))
+    err-invalid-token)))
+
+(define-public (batch-verify-certificates (token-ids (list 10 uint)))
+  (ok (map verify-single-certificate token-ids)))
+
+(define-private (verify-single-certificate (token-id uint))
+  (match (verify-certificate token-id)
+    success success
+    error {
+      token-id: token-id,
+      is-valid: false,
+      is-revoked: false,
+      is-expired: false,
+      issuer-authorized: false,
+      owner: none,
+      issuer: 'SP000000000000000000002Q6VF78,
+      recipient: 'SP000000000000000000002Q6VF78,
+      course: "",
+      grade: "",
+      institution: "",
+      issue-date: u0,
+      verification-date: stacks-block-height
+    }))
+
+(define-private (update-verification-log (token-id uint))
+  (let (
+    (current-log (map-get? verification-logs token-id))
+    (new-count (match current-log
+      log (+ (get verification-count log) u1)
+      u1))
+  )
+  (begin
+    (map-set verification-logs token-id {
+      verifier: tx-sender,
+      verification-date: stacks-block-height,
+      verification-count: new-count
+    })
+    (var-set total-verifications (+ (var-get total-verifications) u1)))))
+
+(define-read-only (get-verification-stats (token-id uint))
+  (ok (map-get? verification-logs token-id)))
+
+(define-read-only (get-total-verifications)
+  (ok (var-get total-verifications)))
+
+(define-read-only (is-certificate-expired (token-id uint))
+  (match (map-get? certificate-metadata token-id)
+    metadata (ok (> stacks-block-height (get expiration-date metadata)))
+    (ok false)))
+
+(define-read-only (get-certificate-status (token-id uint))
+  (let (
+    (exists (is-some (map-get? certificate-data token-id)))
+    (is-revoked (default-to false (map-get? revoked-certificates token-id)))
+    (is-expired (unwrap-panic (is-certificate-expired token-id)))
+    (owner (nft-get-owner? certificate token-id))
+  )
+  (ok {
+    exists: exists,
+    has-owner: (is-some owner),
+    is-revoked: is-revoked,
+    is-expired: is-expired,
+    overall-valid: (and exists (is-some owner) (not is-revoked) (not is-expired))
+  })))
+
+(define-public (verify-certificate-for-recipient (token-id uint) (expected-recipient principal))
+  (match (verify-certificate token-id)
+    verification-result 
+      (ok (and 
+        (get is-valid verification-result)
+        (is-eq (get recipient verification-result) expected-recipient)))
+    error (ok false)))
+
+;; (define-read-only (get-certificates-by-institution (institution (string-ascii 50)) (max-tokens uint))
+;;   (ok (filter (lambda (token-id) (check-institution-match token-id institution)) 
+;;               (generate-token-sequence max-tokens))))
+
+(define-private (check-institution-match (token-id uint) (target-institution (string-ascii 50)))
+  (match (map-get? certificate-data token-id)
+    data (is-eq (get institution data) target-institution)
+    false))
+
+(define-private (generate-token-sequence (max-tokens uint))
+  (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10))
