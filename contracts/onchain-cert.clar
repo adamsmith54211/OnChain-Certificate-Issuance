@@ -256,9 +256,6 @@
         (is-eq (get recipient verification-result) expected-recipient)))
     error (ok false)))
 
-;; (define-read-only (get-certificates-by-institution (institution (string-ascii 50)) (max-tokens uint))
-;;   (ok (filter (lambda (token-id) (check-institution-match token-id institution)) 
-;;               (generate-token-sequence max-tokens))))
 
 (define-private (check-institution-match (token-id uint) (target-institution (string-ascii 50)))
   (match (map-get? certificate-data token-id)
@@ -267,3 +264,111 @@
 
 (define-private (generate-token-sequence (max-tokens uint))
   (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10))
+
+
+  (define-constant err-delegation-not-found (err u300))
+(define-constant err-delegation-expired (err u301))
+(define-constant err-unauthorized-delegator (err u302))
+
+(define-map certificate-delegations
+  {delegator: principal, delegatee: principal, course: (string-ascii 50)}
+  {
+    active: bool,
+    expiration-height: uint,
+    max-certificates: uint,
+    certificates-issued: uint,
+    created-at: uint
+  })
+
+(define-public (delegate-certificate-authority 
+    (delegatee principal)
+    (course (string-ascii 50))
+    (expiration-height uint)
+    (max-certificates uint))
+  (begin
+    (asserts! (is-authorized-issuer tx-sender) err-not-authorized)
+    (ok (map-set certificate-delegations
+      {delegator: tx-sender, delegatee: delegatee, course: course}
+      {
+        active: true,
+        expiration-height: expiration-height,
+        max-certificates: max-certificates,
+        certificates-issued: u0,
+        created-at: stacks-block-height
+      }))))
+
+(define-public (revoke-delegation 
+    (delegatee principal)
+    (course (string-ascii 50)))
+  (let ((delegation-key {delegator: tx-sender, delegatee: delegatee, course: course}))
+    (asserts! (is-authorized-issuer tx-sender) err-not-authorized)
+    (asserts! (is-some (map-get? certificate-delegations delegation-key)) err-delegation-not-found)
+    (ok (map-set certificate-delegations delegation-key
+      {
+        active: false,
+        expiration-height: u0,
+        max-certificates: u0,
+        certificates-issued: u0,
+        created-at: u0
+      }))))
+
+(define-private (is-valid-delegation (delegator principal) (delegatee principal) (course (string-ascii 50)))
+  (let ((delegation-key {delegator: delegator, delegatee: delegatee, course: course}))
+    (match (map-get? certificate-delegations delegation-key)
+      delegation-data (and 
+        (get active delegation-data)
+        (< stacks-block-height (get expiration-height delegation-data))
+        (< (get certificates-issued delegation-data) (get max-certificates delegation-data)))
+      false)))
+
+
+
+(define-private (get-current-course)
+  (some {course: "default"}))
+
+(define-private (update-delegation-counter (delegator principal) (course (string-ascii 50)))
+  (let ((delegation-key {delegator: delegator, delegatee: tx-sender, course: course}))
+    (match (map-get? certificate-delegations delegation-key)
+      delegation-data (map-set certificate-delegations delegation-key
+        {
+          active: (get active delegation-data),
+          expiration-height: (get expiration-height delegation-data),
+          max-certificates: (get max-certificates delegation-data),
+          certificates-issued: (+ (get certificates-issued delegation-data) u1),
+          created-at: (get created-at delegation-data)
+        })
+      false)))
+
+(define-public (issue-certificate-delegated
+    (recipient principal)
+    (course (string-ascii 50))
+    (grade (string-ascii 2))
+    (institution (string-ascii 50))
+    (delegator principal))
+  (let ((new-id (+ (var-get last-token-id) u1)))
+    (asserts! (is-authorized-issuer delegator) err-not-authorized)
+    (asserts! (is-valid-delegation delegator tx-sender course) err-delegation-not-found)
+    (asserts! (is-none (nft-get-owner? certificate new-id)) err-already-exists)
+    (try! (nft-mint? certificate new-id recipient))
+    (map-set certificate-data new-id
+      {
+        issuer: delegator,
+        recipient: recipient,
+        course: course,
+        grade: grade,
+        date: stacks-block-height,
+        institution: institution
+      })
+    (var-set last-token-id new-id)
+    (update-delegation-counter delegator course)
+    (ok new-id)))
+
+(define-read-only (get-delegation-info (delegator principal) (delegatee principal) (course (string-ascii 50)))
+  (ok (map-get? certificate-delegations {delegator: delegator, delegatee: delegatee, course: course})))
+
+
+
+(define-private (check-any-valid-delegation (delegator principal) (found-valid bool))
+  (if found-valid
+    true
+    (is-valid-delegation delegator tx-sender "default")))
