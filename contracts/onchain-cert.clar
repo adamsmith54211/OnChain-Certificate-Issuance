@@ -323,20 +323,19 @@
 
 
 
-(define-private (get-current-course)
-  (some {course: "default"}))
-
 (define-private (update-delegation-counter (delegator principal) (course (string-ascii 50)))
   (let ((delegation-key {delegator: delegator, delegatee: tx-sender, course: course}))
     (match (map-get? certificate-delegations delegation-key)
-      delegation-data (map-set certificate-delegations delegation-key
-        {
-          active: (get active delegation-data),
-          expiration-height: (get expiration-height delegation-data),
-          max-certificates: (get max-certificates delegation-data),
-          certificates-issued: (+ (get certificates-issued delegation-data) u1),
-          created-at: (get created-at delegation-data)
-        })
+      delegation-data (begin
+        (map-set certificate-delegations delegation-key
+          {
+            active: (get active delegation-data),
+            expiration-height: (get expiration-height delegation-data),
+            max-certificates: (get max-certificates delegation-data),
+            certificates-issued: (+ (get certificates-issued delegation-data) u1),
+            created-at: (get created-at delegation-data)
+          })
+        true)
       false)))
 
 (define-public (issue-certificate-delegated
@@ -366,9 +365,275 @@
 (define-read-only (get-delegation-info (delegator principal) (delegatee principal) (course (string-ascii 50)))
   (ok (map-get? certificate-delegations {delegator: delegator, delegatee: delegatee, course: course})))
 
+;; === CERTIFICATE SKILLS MAPPING & COMPETENCY TRACKING SYSTEM ===
+
+;; Error constants for skills system
+(define-constant err-skill-not-found (err u400))
+(define-constant err-skill-exists (err u401))
+(define-constant err-invalid-proficiency (err u402))
+(define-constant err-no-skills-mapped (err u403))
+
+;; Skills registry data structures
+(define-map skills-registry
+  (string-ascii 30) ;; skill-name
+  {
+    category: (string-ascii 25),
+    created-by: principal,
+    creation-height: uint,
+    verification-count: uint
+  })
+
+;; Map certificates to their skills with proficiency levels
+(define-map certificate-skills
+  uint ;; token-id
+  {
+    primary-skills: (list 5 (string-ascii 30)),
+    secondary-skills: (list 5 (string-ascii 30)),
+    proficiency-levels: (list 10 uint), ;; 1-100 scale
+    skills-validated: bool,
+    competency-score: uint
+  })
+
+;; Track individual skill proficiencies by recipient
+(define-map recipient-skills
+  {recipient: principal, skill: (string-ascii 30)}
+  {
+    total-certificates: uint,
+    average-proficiency: uint,
+    highest-proficiency: uint,
+    latest-certificate: uint,
+    last-updated: uint
+  })
+
+;; Skills category mapping for organization
+(define-map skill-categories
+  (string-ascii 25) ;; category-name  
+  {
+    total-skills: uint,
+    active-certificates: uint,
+    category-weight: uint
+  })
+
+;; Data variables for tracking
+(define-data-var total-skills-registered uint u0)
+(define-data-var total-skill-mappings uint u0)
+
+;; Register a new skill in the system
+(define-public (register-skill 
+    (skill-name (string-ascii 30))
+    (category (string-ascii 25)))
+  (begin
+    (asserts! (is-authorized-issuer tx-sender) err-not-authorized)
+    (asserts! (is-none (map-get? skills-registry skill-name)) err-skill-exists)
+    (map-set skills-registry skill-name
+      {
+        category: category,
+        created-by: tx-sender,
+        creation-height: stacks-block-height,
+        verification-count: u0
+      })
+    (update-skill-category-count category)
+    (var-set total-skills-registered (+ (var-get total-skills-registered) u1))
+    (ok skill-name)))
+
+;; Map skills to an existing certificate
+(define-public (map-certificate-skills
+    (token-id uint)
+    (primary-skills (list 5 (string-ascii 30)))
+    (secondary-skills (list 5 (string-ascii 30)))
+    (proficiency-levels (list 10 uint)))
+  (let ((cert-data (unwrap! (map-get? certificate-data token-id) err-invalid-cert)))
+    (asserts! (is-authorized-issuer tx-sender) err-not-authorized)
+    (asserts! (is-eq (get issuer cert-data) tx-sender) err-not-authorized)
+    (asserts! (validate-proficiency-levels proficiency-levels) err-invalid-proficiency)
+    (asserts! (validate-skills-exist primary-skills secondary-skills) err-skill-not-found)
+    (let ((competency-score (calculate-competency-score proficiency-levels)))
+      (map-set certificate-skills token-id
+        {
+          primary-skills: primary-skills,
+          secondary-skills: secondary-skills,
+          proficiency-levels: proficiency-levels,
+          skills-validated: true,
+          competency-score: competency-score
+        })
+      (update-recipient-skills (get recipient cert-data) primary-skills secondary-skills proficiency-levels token-id)
+      (var-set total-skill-mappings (+ (var-get total-skill-mappings) u1))
+      (ok competency-score))))
+
+;; Validate that proficiency levels are within acceptable range
+(define-private (validate-proficiency-levels (levels (list 10 uint)))
+  (fold validate-single-proficiency levels true))
+
+(define-private (validate-single-proficiency (level uint) (valid-so-far bool))
+  (and valid-so-far (and (>= level u1) (<= level u100))))
+
+;; Validate that all listed skills exist in registry
+(define-private (validate-skills-exist 
+    (primary-skills (list 5 (string-ascii 30)))
+    (secondary-skills (list 5 (string-ascii 30))))
+  (and 
+    (fold validate-skill-exists primary-skills true)
+    (fold validate-skill-exists secondary-skills true)))
+
+(define-private (validate-skill-exists (skill-name (string-ascii 30)) (valid-so-far bool))
+  (if (is-eq skill-name "")
+    valid-so-far
+    (and valid-so-far (is-some (map-get? skills-registry skill-name)))))
+
+;; Calculate overall competency score based on proficiency levels
+(define-private (calculate-competency-score (proficiencies (list 10 uint)))
+  (let ((sum (fold add-proficiency proficiencies u0))
+        (count (fold count-non-zero proficiencies u0)))
+    (if (> count u0)
+      (/ sum count)
+      u0)))
+
+(define-private (add-proficiency (level uint) (sum uint))
+  (if (> level u0)
+    (+ sum level)
+    sum))
+
+(define-private (count-non-zero (level uint) (count uint))
+  (if (> level u0)
+    (+ count u1)
+    count))
+
+;; Update recipient's skill tracking with new certificate data
+(define-private (update-recipient-skills 
+    (recipient principal)
+    (primary-skills (list 5 (string-ascii 30)))
+    (secondary-skills (list 5 (string-ascii 30)))
+    (proficiency-levels (list 10 uint))
+    (token-id uint))
+  (begin
+    (update-skills-for-recipient recipient primary-skills proficiency-levels token-id u0)
+    (update-skills-for-recipient recipient secondary-skills proficiency-levels token-id u5)
+    true))
+
+;; Helper to update skills starting from a specific index
+(define-private (update-skills-for-recipient 
+    (recipient principal)
+    (skills (list 5 (string-ascii 30)))
+    (proficiency-levels (list 10 uint))
+    (token-id uint)
+    (start-index uint))
+  (fold process-recipient-skill 
+    (zip skills (slice-proficiencies proficiency-levels start-index))
+    recipient))
+
+;; Process individual skill update for recipient
+(define-private (process-recipient-skill 
+    (skill-data {skill: (string-ascii 30), proficiency: uint})
+    (recipient principal))
+  (let ((skill-name (get skill skill-data))
+        (proficiency (get proficiency skill-data)))
+    (if (and (not (is-eq skill-name "")) (> proficiency u0))
+      (update-single-recipient-skill recipient skill-name proficiency)
+      recipient)))
+
+;; Update a single skill entry for a recipient
+(define-private (update-single-recipient-skill 
+    (recipient principal)
+    (skill-name (string-ascii 30))
+    (new-proficiency uint))
+  (let ((skill-key {recipient: recipient, skill: skill-name})
+        (existing-data (map-get? recipient-skills skill-key)))
+    (match existing-data
+      current-skill (let ((new-total (+ (get total-certificates current-skill) u1))
+                         (new-avg (/ (+ (* (get average-proficiency current-skill) 
+                                          (get total-certificates current-skill))
+                                       new-proficiency) new-total)))
+        (map-set recipient-skills skill-key
+          {
+            total-certificates: new-total,
+            average-proficiency: new-avg,
+            highest-proficiency: (if (> new-proficiency (get highest-proficiency current-skill))
+                                   new-proficiency
+                                   (get highest-proficiency current-skill)),
+            latest-certificate: u0, ;; Could be set to token-id if needed
+            last-updated: stacks-block-height
+          }))
+      (map-set recipient-skills skill-key
+        {
+          total-certificates: u1,
+          average-proficiency: new-proficiency,
+          highest-proficiency: new-proficiency,
+          latest-certificate: u0,
+          last-updated: stacks-block-height
+        }))
+    recipient))
+
+;; Helper functions for list operations
+(define-private (zip (list-a (list 5 (string-ascii 30))) (list-b (list 5 uint)))
+  (list 
+    {skill: (unwrap-panic (element-at list-a u0)), proficiency: (unwrap-panic (element-at list-b u0))}
+    {skill: (unwrap-panic (element-at list-a u1)), proficiency: (unwrap-panic (element-at list-b u1))}
+    {skill: (unwrap-panic (element-at list-a u2)), proficiency: (unwrap-panic (element-at list-b u2))}
+    {skill: (unwrap-panic (element-at list-a u3)), proficiency: (unwrap-panic (element-at list-b u3))}
+    {skill: (unwrap-panic (element-at list-a u4)), proficiency: (unwrap-panic (element-at list-b u4))}))
+
+(define-private (slice-proficiencies (levels (list 10 uint)) (start-index uint))
+  (if (is-eq start-index u0)
+    (list 
+      (unwrap-panic (element-at levels u0))
+      (unwrap-panic (element-at levels u1))
+      (unwrap-panic (element-at levels u2))
+      (unwrap-panic (element-at levels u3))
+      (unwrap-panic (element-at levels u4)))
+    (list 
+      (unwrap-panic (element-at levels u5))
+      (unwrap-panic (element-at levels u6))
+      (unwrap-panic (element-at levels u7))
+      (unwrap-panic (element-at levels u8))
+      (unwrap-panic (element-at levels u9)))))
+
+;; Update skill category statistics
+(define-private (update-skill-category-count (category (string-ascii 25)))
+  (let ((current-data (map-get? skill-categories category)))
+    (match current-data
+      existing (map-set skill-categories category
+        {
+          total-skills: (+ (get total-skills existing) u1),
+          active-certificates: (get active-certificates existing),
+          category-weight: (get category-weight existing)
+        })
+      (map-set skill-categories category
+        {
+          total-skills: u1,
+          active-certificates: u0,
+          category-weight: u50
+        }))))
+
+;; Read-only functions for querying skills data
+
+(define-read-only (get-certificate-skills (token-id uint))
+  (ok (map-get? certificate-skills token-id)))
+
+(define-read-only (get-skill-info (skill-name (string-ascii 30)))
+  (ok (map-get? skills-registry skill-name)))
+
+(define-read-only (get-recipient-skill-summary (recipient principal) (skill-name (string-ascii 30)))
+  (ok (map-get? recipient-skills {recipient: recipient, skill: skill-name})))
+
+(define-read-only (get-skill-category-stats (category (string-ascii 25)))
+  (ok (map-get? skill-categories category)))
+
+(define-read-only (get-skills-system-stats)
+  (ok {
+    total-skills: (var-get total-skills-registered),
+    total-mappings: (var-get total-skill-mappings),
+    system-height: stacks-block-height
+  }))
+
+;; Advanced query: Find certificates by skill proficiency threshold
+(define-read-only (has-skill-proficiency 
+    (recipient principal)
+    (skill-name (string-ascii 30))
+    (min-proficiency uint))
+  (match (map-get? recipient-skills {recipient: recipient, skill: skill-name})
+    skill-data (ok (>= (get highest-proficiency skill-data) min-proficiency))
+    (ok false)))
 
 
-(define-private (check-any-valid-delegation (delegator principal) (found-valid bool))
-  (if found-valid
-    true
-    (is-valid-delegation delegator tx-sender "default")))
+
+
