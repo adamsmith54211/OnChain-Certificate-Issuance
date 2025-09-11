@@ -634,6 +634,191 @@
     skill-data (ok (>= (get highest-proficiency skill-data) min-proficiency))
     (ok false)))
 
+;; === CERTIFICATE TEMPLATE SYSTEM ===
+
+;; Error constants for template system
+(define-constant err-template-not-found (err u500))
+(define-constant err-template-exists (err u501))
+(define-constant err-template-inactive (err u502))
+(define-constant err-requirements-not-met (err u503))
+(define-constant err-invalid-template-data (err u504))
+
+;; Template system data structures
+(define-data-var next-template-id uint u1)
+(define-data-var total-templates-created uint u0)
+
+;; Core template registry
+(define-map template-registry
+  uint ;; template-id
+  {
+    creator: principal,
+    name: (string-ascii 50),
+    category: (string-ascii 25),
+    active: bool,
+    version: uint,
+    created-height: uint
+  })
+
+;; Template requirements and validation rules
+(define-map template-requirements
+  uint ;; template-id
+  {
+    min-course-duration: uint,
+    required-skills: (list 3 (string-ascii 30)),
+    min-proficiency-threshold: uint,
+    prerequisite-template-ids: (list 2 uint),
+    min-grade-requirement: (string-ascii 2)
+  })
+
+;; Template usage statistics and tracking
+(define-map template-stats
+  uint ;; template-id
+  {
+    certificates-issued: uint,
+    last-used-height: uint,
+    success-validations: uint,
+    total-validations: uint
+  })
+
+;; Institution template access control
+(define-map institution-template-access
+  {institution: principal, template-id: uint}
+  bool)
+
+;; Create a new certificate template
+(define-public (create-certificate-template
+    (name (string-ascii 50))
+    (category (string-ascii 25))
+    (min-duration uint)
+    (required-skills (list 3 (string-ascii 30)))
+    (min-proficiency uint)
+    (min-grade (string-ascii 2)))
+  (let ((template-id (var-get next-template-id)))
+    (asserts! (is-authorized-issuer tx-sender) err-not-authorized)
+    (asserts! (> (len name) u0) err-invalid-template-data)
+    (asserts! (validate-template-skills required-skills) err-skill-not-found)
+    (map-set template-registry template-id
+      {
+        creator: tx-sender,
+        name: name,
+        category: category,
+        active: true,
+        version: u1,
+        created-height: stacks-block-height
+      })
+    (map-set template-requirements template-id
+      {
+        min-course-duration: min-duration,
+        required-skills: required-skills,
+        min-proficiency-threshold: min-proficiency,
+        prerequisite-template-ids: (list),
+        min-grade-requirement: min-grade
+      })
+    (map-set template-stats template-id
+      {
+        certificates-issued: u0,
+        last-used-height: u0,
+        success-validations: u0,
+        total-validations: u0
+      })
+    (map-set institution-template-access {institution: tx-sender, template-id: template-id} true)
+    (var-set next-template-id (+ template-id u1))
+    (var-set total-templates-created (+ (var-get total-templates-created) u1))
+    (ok template-id)))
+
+;; Issue certificate using an approved template
+(define-public (issue-certificate-from-template
+    (template-id uint)
+    (recipient principal)
+    (course (string-ascii 50))
+    (grade (string-ascii 2))
+    (institution (string-ascii 50)))
+  (let ((template-info (unwrap! (map-get? template-registry template-id) err-template-not-found))
+        (template-reqs (unwrap! (map-get? template-requirements template-id) err-template-not-found))
+        (has-access (default-to false (map-get? institution-template-access {institution: tx-sender, template-id: template-id})))
+        (new-cert-id (+ (var-get last-token-id) u1)))
+    (asserts! (get active template-info) err-template-inactive)
+    (asserts! (or (is-eq tx-sender (get creator template-info)) has-access) err-not-authorized)
+    (asserts! (validate-grade-requirement grade (get min-grade-requirement template-reqs)) err-requirements-not-met)
+    (try! (nft-mint? certificate new-cert-id recipient))
+    (map-set certificate-data new-cert-id
+      {
+        issuer: tx-sender,
+        recipient: recipient,
+        course: course,
+        grade: grade,
+        date: stacks-block-height,
+        institution: institution
+      })
+    (var-set last-token-id new-cert-id)
+    (update-template-usage-stats template-id)
+    (ok new-cert-id)))
+
+;; Grant template access to an institution
+(define-public (grant-template-access (template-id uint) (institution principal))
+  (let ((template-info (unwrap! (map-get? template-registry template-id) err-template-not-found)))
+    (asserts! (is-eq tx-sender (get creator template-info)) err-not-authorized)
+    (asserts! (get active template-info) err-template-inactive)
+    (ok (map-set institution-template-access {institution: institution, template-id: template-id} true))))
+
+;; Deactivate a template
+(define-public (deactivate-template (template-id uint))
+  (let ((template-info (unwrap! (map-get? template-registry template-id) err-template-not-found)))
+    (asserts! (is-eq tx-sender (get creator template-info)) err-not-authorized)
+    (ok (map-set template-registry template-id
+      (merge template-info {active: false})))))
+
+;; Validation helper functions
+(define-private (validate-template-skills (skills (list 3 (string-ascii 30))))
+  (fold validate-template-skill skills true))
+
+(define-private (validate-template-skill (skill-name (string-ascii 30)) (valid-so-far bool))
+  (if (is-eq skill-name "")
+    valid-so-far
+    (and valid-so-far (is-some (map-get? skills-registry skill-name)))))
+
+(define-private (validate-grade-requirement (actual-grade (string-ascii 2)) (min-grade (string-ascii 2)))
+  (if (is-eq min-grade "")
+    true
+    (grade-meets-minimum actual-grade min-grade)))
+
+(define-private (grade-meets-minimum (grade (string-ascii 2)) (min-grade (string-ascii 2)))
+  (or (is-eq grade "A+") (is-eq grade "A") (is-eq grade "A-")
+      (and (not (is-eq min-grade "A")) 
+           (or (is-eq grade "B+") (is-eq grade "B") (is-eq grade "B-")))
+      (and (not (or (is-eq min-grade "A") (is-eq min-grade "B")))
+           (or (is-eq grade "C+") (is-eq grade "C")))))
+
+(define-private (update-template-usage-stats (template-id uint))
+  (let ((current-stats (default-to 
+         {certificates-issued: u0, last-used-height: u0, success-validations: u0, total-validations: u0}
+         (map-get? template-stats template-id))))
+    (map-set template-stats template-id
+      (merge current-stats 
+        {
+          certificates-issued: (+ (get certificates-issued current-stats) u1),
+          last-used-height: stacks-block-height
+        }))))
+
+;; Read-only functions for template system
+(define-read-only (get-template-info (template-id uint))
+  (ok (map-get? template-registry template-id)))
+
+(define-read-only (get-template-requirements (template-id uint))
+  (ok (map-get? template-requirements template-id)))
+
+(define-read-only (get-template-stats (template-id uint))
+  (ok (map-get? template-stats template-id)))
+
+(define-read-only (has-template-access (institution principal) (template-id uint))
+  (ok (default-to false (map-get? institution-template-access {institution: institution, template-id: template-id}))))
+
+(define-read-only (get-template-system-stats)
+  (ok {
+    total-templates: (var-get total-templates-created),
+    next-id: (var-get next-template-id)
+  }))
+
 
 
 
